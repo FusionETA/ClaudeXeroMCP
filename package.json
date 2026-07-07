@@ -4,7 +4,8 @@
   "description": "Minimal local Xero OAuth 2.0 server for Claude Desktop MCP token",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "node patch-xero-client.js"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
