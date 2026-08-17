@@ -69,6 +69,12 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL ||
 const MCP_MESSAGE_PATH = '/message';
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
 
+// Streamable HTTP transport tuning. A session owns one xero-mcp-server
+// subprocess, so idle sessions must be reaped or every probe from a
+// connector-validation service leaks a child process.
+const MCP_HTTP_IDLE_MS = Number(process.env.MCP_HTTP_IDLE_MS || 10 * 60 * 1000);
+const MCP_HTTP_REQUEST_TIMEOUT_MS = Number(process.env.MCP_HTTP_REQUEST_TIMEOUT_MS || 120_000);
+
 // ── Token storage (NeonDB) ───────────────────────────────────────────────────
 
 /** Create table on first run if it doesn't exist yet */
@@ -661,6 +667,212 @@ async function handleMcpPost(req, res) {
   }
 }
 
+// ── Streamable HTTP transport (MCP 2025-03-26 / 2025-06-18) ─────────────────
+//
+// The legacy transport above (GET /sse + POST /message) is what Claude Desktop
+// and the claude.ai chat runtime still speak. Newer clients — including the
+// connector-validation service claude.ai runs when you add or sign into a
+// connector — try Streamable HTTP FIRST: a plain POST of JSON-RPC to the MCP
+// URL itself. Before this existed that POST 404'd, and the client read the
+// 404 as "this endpoint must be behind a sign-in", walked the OAuth discovery
+// chain (/.well-known/oauth-protected-resource → oauth-authorization-server →
+// POST /register), found nothing, and reported "Couldn't register with this
+// server's sign-in service".
+//
+// So POST is mounted on BOTH /mcp and /sse: /sse is the URL already sitting in
+// people's connector settings, and the transport a client gets must depend on
+// its HTTP method, not on which path it was handed.
+//
+// Auth is unchanged — the MCP_AUTH_TOKEN shared secret, as a bearer header or
+// ?token=. Note the 401 below deliberately carries NO WWW-Authenticate header:
+// that header is exactly what tells an MCP client to go start an OAuth flow,
+// and this server has no OAuth server to send it to.
+
+app.post('/mcp', mcpJsonBody, handleStreamableHttpPost);
+app.post('/sse', mcpJsonBody, handleStreamableHttpPost);
+app.delete('/mcp', handleStreamableHttpDelete);
+app.delete('/sse', handleStreamableHttpDelete);
+
+// Spec allows a server that doesn't offer a server→client stream on GET to
+// refuse it. GET /sse is NOT included here — that's the legacy SSE transport
+// and it keeps working exactly as before.
+app.get('/mcp', (req, res) => {
+  if (!isMcpAuthorized(req)) return res.status(401).send('Unauthorized');
+  return res.status(405).set('Allow', 'POST, DELETE').send('Use POST for Streamable HTTP, or GET /sse for the SSE transport');
+});
+
+async function handleStreamableHttpPost(req, res) {
+  if (!isMcpAuthorized(req)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  const batch = Array.isArray(req.body) ? req.body : [req.body];
+  if (!batch.length || batch.some(m => !m || typeof m !== 'object')) {
+    return res.status(400).json(jsonRpcError(null, -32700, 'Parse error: expected a JSON-RPC message or batch'));
+  }
+
+  const wantsInit = batch.some(m => m.method === 'initialize');
+  const headerSessionId = String(req.get('mcp-session-id') || '');
+  let session;
+
+  if (wantsInit) {
+    const tokens = await refreshIfNeeded();
+    if (!tokens) {
+      return res.status(503).json(jsonRpcError(firstRequestId(batch), -32000, 'Xero is not authenticated. Visit /login first.'));
+    }
+
+    try {
+      session = createMcpSession(tokens);
+    } catch (err) {
+      console.error('[mcp-bridge] Failed to start xero-mcp-server:', err.message);
+      return res.status(500).json(jsonRpcError(firstRequestId(batch), -32000, 'Failed to start Xero MCP server'));
+    }
+
+    session.mode = 'http';
+    mcpSessions.set(session.id, session);
+
+    // Same reasoning as the SSE path: the child was handed a Xero access token
+    // at spawn time and can't be re-keyed, so retire the session just before
+    // that token expires. The client's next POST gets a 404 and re-initializes
+    // against a child holding a fresh token.
+    const refreshDelay = tokens.expires_at - Date.now() - 60_000;
+    session.tokenExpiryTimer = setTimeout(() => {
+      closeMcpSession(session, 'Xero token is nearing expiry; client should re-initialize');
+    }, Math.max(refreshDelay, 5_000));
+
+    res.setHeader('Mcp-Session-Id', session.id);
+    console.log(`[mcp-bridge] HTTP session ${session.id} started for ${tokens.tenant_name || tokens.tenant_id || 'Xero tenant'}`);
+  } else {
+    session = headerSessionId ? mcpSessions.get(headerSessionId) : null;
+    if (!session || session.closed || session.mode !== 'http') {
+      // 404 is the spec's "your session is gone" signal — the client responds
+      // by starting a new initialize handshake rather than erroring out.
+      return res.status(404).json(jsonRpcError(firstRequestId(batch), -32001, 'Unknown or expired MCP session'));
+    }
+  }
+
+  touchHttpSession(session);
+
+  // Requests expect responses; notifications and responses don't. A batch of
+  // only the latter is acknowledged with 202 and nothing else.
+  const requestIds = batch
+    .filter(m => typeof m.method === 'string' && Object.prototype.hasOwnProperty.call(m, 'id'))
+    .map(m => m.id);
+
+  if (!requestIds.length) {
+    try {
+      await writeJsonRpcToChild(session, req.body);
+      return res.status(202).end();
+    } catch (err) {
+      console.error(`[mcp-bridge] Failed to forward notification for session ${session.id}:`, err.message);
+      return res.status(500).json(jsonRpcError(null, -32000, 'Failed to forward message to Xero MCP server'));
+    }
+  }
+
+  // Register the waiters BEFORE writing to stdin — the child can answer
+  // faster than the write callback resolves.
+  const waiter = waitForHttpResponses(session, requestIds);
+
+  try {
+    await writeJsonRpcToChild(session, req.body);
+  } catch (err) {
+    cancelHttpWaiters(session, requestIds);
+    console.error(`[mcp-bridge] Failed to forward message for session ${session.id}:`, err.message);
+    return res.status(500).json(jsonRpcError(requestIds[0], -32000, 'Failed to forward message to Xero MCP server'));
+  }
+
+  const responses = await waiter;
+  const payload = Array.isArray(req.body) ? responses : responses[0];
+  return respondJsonRpc(req, res, payload);
+}
+
+function handleStreamableHttpDelete(req, res) {
+  if (!isMcpAuthorized(req)) return res.status(401).send('Unauthorized');
+
+  const sessionId = String(req.get('mcp-session-id') || '');
+  const session = sessionId ? mcpSessions.get(sessionId) : null;
+  if (!session || session.mode !== 'http') return res.status(404).send('Session not found');
+
+  closeMcpSession(session, 'client sent DELETE');
+  return res.status(204).end();
+}
+
+/**
+ * Park one promise per in-flight request id. Resolved by
+ * `dispatchChildMessage` when the child answers, by `sendPendingErrors` when
+ * the child dies, or by a timeout so a wedged subprocess can't hold the HTTP
+ * response open forever.
+ */
+function waitForHttpResponses(session, requestIds) {
+  return Promise.all(requestIds.map(id => new Promise(resolve => {
+    const key = httpWaiterKey(id);
+    const timer = setTimeout(() => {
+      session.httpWaiters.delete(key);
+      resolve(jsonRpcError(id, -32001, 'Timed out waiting for the Xero MCP server to respond'));
+    }, MCP_HTTP_REQUEST_TIMEOUT_MS);
+    timer.unref?.();
+    session.httpWaiters.set(key, { id, resolve, timer });
+  })));
+}
+
+function cancelHttpWaiters(session, requestIds) {
+  for (const id of requestIds) {
+    const key = httpWaiterKey(id);
+    const waiter = session.httpWaiters.get(key);
+    if (!waiter) continue;
+    clearTimeout(waiter.timer);
+    session.httpWaiters.delete(key);
+  }
+}
+
+/** JSON-RPC ids may be numbers or strings; 1 and "1" are different ids. */
+function httpWaiterKey(id) {
+  return `${typeof id}:${String(id)}`;
+}
+
+function touchHttpSession(session) {
+  if (session.mode !== 'http') return;
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  session.idleTimer = setTimeout(() => {
+    closeMcpSession(session, `idle for ${Math.round(MCP_HTTP_IDLE_MS / 1000)}s`);
+  }, MCP_HTTP_IDLE_MS);
+  session.idleTimer.unref?.();
+}
+
+/**
+ * Streamable HTTP lets the server answer with either a JSON body or an SSE
+ * stream. JSON is preferred when the client accepts it — one response, no
+ * stream teardown to get wrong. SSE is used only when that's all it accepts.
+ */
+function respondJsonRpc(req, res, payload) {
+  const accept = String(req.get('accept') || '');
+  const acceptsJson = accept === '' || accept.includes('application/json') || accept.includes('*/*');
+
+  if (!acceptsJson && accept.includes('text/event-stream')) {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    for (const message of (Array.isArray(payload) ? payload : [payload])) {
+      res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
+    }
+    return res.end();
+  }
+
+  return res.status(200).json(payload);
+}
+
+function jsonRpcError(id, code, message) {
+  return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
+}
+
+function firstRequestId(batch) {
+  const withId = batch.find(m => m && Object.prototype.hasOwnProperty.call(m, 'id'));
+  return withId ? withId.id : null;
+}
+
 function createMcpSession(tokens) {
   const id = crypto.randomUUID();
   const child = spawn(process.execPath, [require.resolve('@xeroapi/xero-mcp-server')], {
@@ -677,10 +889,15 @@ function createMcpSession(tokens) {
   const session = {
     id,
     child,
+    // 'sse'  → legacy transport, replies stream out of session.res
+    // 'http' → Streamable HTTP, replies resolve the promises in httpWaiters
+    mode: 'sse',
     res: null,
     stdoutBuffer: '',
     pendingRequestIds: new Set(),
+    httpWaiters: new Map(),
     heartbeat: null,
+    idleTimer: null,
     tokenExpiryTimer: null,
     closed: false,
   };
@@ -720,7 +937,7 @@ function handleChildStdout(session, chunk) {
         for (const id of getJsonRpcIds(message)) {
           session.pendingRequestIds.delete(id);
         }
-        sendSseMessage(session, message);
+        dispatchChildMessage(session, message);
       } catch (err) {
         console.error(`[mcp-bridge] Ignoring non-JSON stdout from xero-mcp-server (${session.id}):`, line);
       }
@@ -752,12 +969,53 @@ function writeJsonRpcToChild(session, message) {
   });
 }
 
+/**
+ * Route one message from the child to whichever transport is waiting for it.
+ * SSE sessions stream everything down the open EventSource; HTTP sessions hand
+ * each response to the POST still holding the socket open for that id.
+ */
+function dispatchChildMessage(session, message) {
+  if (session.mode !== 'http') {
+    sendSseMessage(session, message);
+    return;
+  }
+
+  // The child may emit a batch on one line; each element is settled separately.
+  for (const item of (Array.isArray(message) ? message : [message])) {
+    if (!item || typeof item !== 'object') continue;
+
+    // A response carries an id and no method. Anything with a method is a
+    // server-initiated request or notification, which Streamable HTTP can only
+    // deliver over a GET stream — this server doesn't offer one, so it's logged
+    // and dropped rather than mis-delivered to an unrelated waiter.
+    const isResponse = Object.prototype.hasOwnProperty.call(item, 'id') && typeof item.method !== 'string';
+    const waiter = isResponse ? session.httpWaiters.get(httpWaiterKey(item.id)) : null;
+
+    if (!waiter) {
+      console.log(`[mcp-bridge] HTTP session ${session.id}: dropped unsolicited ${item.method || 'message'}`);
+      continue;
+    }
+
+    clearTimeout(waiter.timer);
+    session.httpWaiters.delete(httpWaiterKey(item.id));
+    waiter.resolve(item);
+  }
+}
+
 function sendSseMessage(session, message) {
   if (session.closed || !session.res || session.res.writableEnded) return;
   session.res.write(`event: message\ndata: ${JSON.stringify(message)}\n\n`);
 }
 
 function sendPendingErrors(session, message) {
+  // HTTP mode: every waiter is an HTTP response still held open. Settle them
+  // with an error object instead of leaving the client hanging until timeout.
+  for (const [key, waiter] of session.httpWaiters) {
+    clearTimeout(waiter.timer);
+    session.httpWaiters.delete(key);
+    waiter.resolve(jsonRpcError(waiter.id, -32000, message));
+  }
+
   for (const id of session.pendingRequestIds) {
     sendSseMessage(session, {
       jsonrpc: '2.0',
@@ -774,7 +1032,12 @@ function closeMcpSession(session, reason, options = {}) {
 
   if (session.heartbeat) clearInterval(session.heartbeat);
   if (session.tokenExpiryTimer) clearTimeout(session.tokenExpiryTimer);
+  if (session.idleTimer) clearTimeout(session.idleTimer);
   mcpSessions.delete(session.id);
+
+  // Anything still waiting on this session gets an error rather than a hung
+  // socket. No-op once sendPendingErrors has already drained the waiters.
+  sendPendingErrors(session, `MCP session closed: ${reason}`);
 
   if (session.res && !session.res.writableEnded) {
     session.res.end();
@@ -790,7 +1053,7 @@ function closeMcpSession(session, reason, options = {}) {
     forceKill.unref?.();
   }
 
-  console.log(`[mcp-bridge] SSE session ${session.id} closed: ${reason}`);
+  console.log(`[mcp-bridge] ${session.mode === 'http' ? 'HTTP' : 'SSE'} session ${session.id} closed: ${reason}`);
 }
 
 function getJsonRpcIds(message) {
