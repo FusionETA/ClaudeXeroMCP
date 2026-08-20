@@ -16,9 +16,11 @@
 'use strict';
 
 require('dotenv').config();
+const path           = require('path');
 const express        = require('express');
 const axios          = require('axios');
 const crypto         = require('crypto');
+const fs             = require('fs');
 const { spawn }      = require('child_process');
 const { neon }       = require('@neondatabase/serverless');
 
@@ -79,51 +81,120 @@ const MCP_HTTP_REQUEST_TIMEOUT_MS = Number(process.env.MCP_HTTP_REQUEST_TIMEOUT_
 
 /** Create table on first run if it doesn't exist yet */
 async function initDb() {
+  // Multi-org support: each row is one Xero org
   await sql`
     CREATE TABLE IF NOT EXISTS xero_tokens (
-      id            INTEGER PRIMARY KEY DEFAULT 1,
+      id            SERIAL PRIMARY KEY,
+      tenant_id     TEXT    UNIQUE NOT NULL,
+      tenant_name   TEXT,
       access_token  TEXT    NOT NULL,
       refresh_token TEXT    NOT NULL,
       expires_at    BIGINT  NOT NULL,
-      tenant_id     TEXT,
-      tenant_name   TEXT,
       authorised_at TEXT,
-      refreshed_at  TEXT
+      refreshed_at  TEXT,
+      is_active     BOOLEAN DEFAULT true
+    )
+  `;
+
+  // Active org tracker (single row)
+  await sql`
+    CREATE TABLE IF NOT EXISTS xero_active_org (
+      id            INTEGER PRIMARY KEY DEFAULT 1,
+      tenant_id     TEXT NOT NULL REFERENCES xero_tokens(tenant_id)
     )
   `;
 }
 
 async function loadTokens() {
-  const rows = await sql`SELECT * FROM xero_tokens WHERE id = 1`;
+  // Get the active org's tokens
+  const active = await sql`SELECT tenant_id FROM xero_active_org WHERE id = 1`;
+  if (!active[0]) return null;
+  const rows = await sql`SELECT * FROM xero_tokens WHERE tenant_id = ${active[0].tenant_id}`;
   return rows[0] ?? null;
+}
+
+async function loadAllOrgs() {
+  return await sql`SELECT tenant_id, tenant_name, authorised_at, is_active FROM xero_tokens ORDER BY authorised_at DESC`;
 }
 
 async function saveTokens(data) {
   await sql`
     INSERT INTO xero_tokens
-      (id, access_token, refresh_token, expires_at, tenant_id, tenant_name, authorised_at, refreshed_at)
+      (tenant_id, tenant_name, access_token, refresh_token, expires_at, authorised_at, refreshed_at, is_active)
     VALUES
-      (1, ${data.access_token}, ${data.refresh_token}, ${data.expires_at},
-       ${data.tenant_id ?? null}, ${data.tenant_name ?? null},
-       ${data.authorised_at ?? null}, ${data.refreshed_at ?? null})
-    ON CONFLICT (id) DO UPDATE SET
+      (${data.tenant_id}, ${data.tenant_name}, ${data.access_token}, ${data.refresh_token},
+       ${data.expires_at}, ${data.authorised_at ?? null}, ${data.refreshed_at ?? null}, true)
+    ON CONFLICT (tenant_id) DO UPDATE SET
       access_token  = EXCLUDED.access_token,
       refresh_token = EXCLUDED.refresh_token,
       expires_at    = EXCLUDED.expires_at,
-      tenant_id     = EXCLUDED.tenant_id,
       tenant_name   = EXCLUDED.tenant_name,
       authorised_at = EXCLUDED.authorised_at,
       refreshed_at  = EXCLUDED.refreshed_at
   `;
+
+  // Set as active org
+  await sql`
+    INSERT INTO xero_active_org (id, tenant_id) VALUES (1, ${data.tenant_id})
+    ON CONFLICT (id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+  `;
+
+  // Auto-update Claude Desktop config with fresh token
+  updateClaudeDesktopConfig(data);
+}
+
+async function switchOrg(tenantId) {
+  await sql`
+    INSERT INTO xero_active_org (id, tenant_id) VALUES (1, ${tenantId})
+    ON CONFLICT (id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+  `;
+  const tokens = await loadTokens();
+  if (tokens) updateClaudeDesktopConfig(tokens);
+  return tokens;
 }
 
 async function clearTokens() {
-  await sql`DELETE FROM xero_tokens WHERE id = 1`;
+  await sql`DELETE FROM xero_tokens`;
+  await sql`DELETE FROM xero_active_org`;
 }
 
 function isExpired(tokens) {
   // Treat as expired 60 seconds early to avoid race conditions
   return !tokens || Date.now() >= (tokens.expires_at - 60_000);
+}
+
+// ── Claude Desktop config auto-update ────────────────────────────────────────
+
+const CLAUDE_DESKTOP_CONFIG = process.env.CLAUDE_DESKTOP_CONFIG ||
+  `${process.env.HOME}/.claude/claude_desktop_config.json`;
+
+function updateClaudeDesktopConfig(tokens) {
+  try {
+    const configPath = CLAUDE_DESKTOP_CONFIG;
+
+    // Read existing config or start fresh
+    let config = {};
+    if (fs.existsSync(configPath)) {
+      const raw = fs.readFileSync(configPath, 'utf8').trim();
+      if (raw) config = JSON.parse(raw);
+    }
+
+    // Ensure mcpServers exists
+    if (!config.mcpServers) config.mcpServers = {};
+
+    // Update xero MCP server config with fresh tokens
+    config.mcpServers.xero = {
+      command: 'node',
+      args: [path.join(__dirname, 'xero-mcp-start.js')],
+    };
+
+    // Write back with proper formatting
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n', 'utf8');
+    console.log('[xero-auth] Claude Desktop config updated:', configPath);
+  } catch (err) {
+    // Don't crash the server if config update fails
+    console.error('[xero-auth] Failed to update Claude Desktop config:', err.message);
+  }
 }
 
 // ── Token refresh ─────────────────────────────────────────────────────────────
@@ -263,26 +334,43 @@ app.get('/', async (req, res) => {
   const orgName   = tokens.tenant_name || 'Unknown Org';
   const remoteMcpUrl = `${getPublicBaseUrl(req)}/sse${MCP_AUTH_TOKEN ? `?token=${encodeURIComponent(MCP_AUTH_TOKEN)}` : ''}`;
 
-  // Build Claude Desktop MCP config
+  // Get all connected orgs for the switcher dropdown
+  const allOrgs = await loadAllOrgs();
+
+  // Build Claude Desktop MCP config (uses launcher that auto-refreshes tokens)
   const mcpConfig = JSON.stringify({
     mcpServers: {
       xero: {
-        command: 'npx',
-        args: ['-y', '@xeroapi/xero-mcp-server'],
-        env: {
-          XERO_CLIENT_ID:           CLIENT_ID,
-          XERO_CLIENT_SECRET:       CLIENT_SECRET,
-          XERO_CLIENT_BEARER_TOKEN: token,
-          XERO_TENANT_ID:           tenantId,
-        },
+        command: 'node',
+        args: [path.join(__dirname, 'xero-mcp-start.js')],
       },
     },
   }, null, 2);
+
+  // Build org switcher dropdown HTML
+  const orgSwitcherHtml = allOrgs.length > 1 ? `
+    <div class="org-switcher">
+      <label class="field-label">Organisation</label>
+      <div class="org-select-wrap">
+        <div class="org-select-box">
+          <span class="org-select-icon">🏢</span>
+          <select id="orgSelect" onchange="switchOrg(this.value)">
+            ${allOrgs.map(o => `
+              <option value="${esc(o.tenant_id)}" ${o.tenant_id === tenantId ? 'selected' : ''}>${esc(o.tenant_name || o.tenant_id)}</option>
+            `).join('')}
+          </select>
+          <span class="org-select-chevron">▾</span>
+        </div>
+        <span class="switch-status" id="switchStatus"></span>
+      </div>
+    </div>
+  ` : '';
 
   return res.send(renderPage({
     title:   `Token — ${orgName}`,
     content: `
       <div class="card">
+        ${orgSwitcherHtml}
         <div class="org-row">
           <span class="org-name">🏢 ${esc(orgName)}</span>
           <span class="expiry ${statusClass}">${statusIcon} ${esc(expiryLabel)} · expires ${expiresAt.toLocaleTimeString()}</span>
@@ -321,11 +409,9 @@ app.get('/', async (req, res) => {
 
       <div class="info-box">
         <strong>📋 How to use:</strong>
-        For Claude.ai on Railway, add the Remote MCP URL above as your custom connector URL.
-        For Claude Desktop, copy the MCP Config JSON above → open <code>~/.claude/claude_desktop_config.json</code>
-        → paste/merge the <code>mcpServers</code> block → restart Claude Desktop.<br>
-        Tokens expire every <strong>30 min</strong>. This page auto-refreshes them on load.
-        Remote MCP sessions close shortly before token expiry so Claude can reconnect with a fresh token.
+        <strong>Claude Desktop:</strong> Config is auto-updated at <code>~/.claude/claude_desktop_config.json</code> when tokens refresh. No manual copying needed!<br>
+        <strong>Claude.ai:</strong> Add the Remote MCP URL above as your custom connector URL.<br>
+        Tokens expire every <strong>30 min</strong> and are auto-refreshed. Restart Claude Desktop if the MCP server shows as disconnected.
       </div>`,
   }));
 });
@@ -543,6 +629,52 @@ app.get('/refresh', async (req, res) => {
 app.get('/logout', async (req, res) => {
   await clearTokens();
   res.redirect('/');
+});
+
+// ── GET /api/orgs — List all connected Xero orgs ────────────────────────────
+
+app.get('/api/orgs', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-store');
+
+  const orgs = await loadAllOrgs();
+  const active = await loadTokens();
+
+  return res.json({
+    ok: true,
+    active_tenant_id: active?.tenant_id || null,
+    orgs,
+  });
+});
+
+// ── POST /api/switch-org — Switch active Xero org ────────────────────────────
+
+app.post('/api/switch-org', express.json(), async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+
+  const { tenant_id } = req.body;
+  if (!tenant_id) {
+    return res.status(400).json({ ok: false, error: 'Missing tenant_id' });
+  }
+
+  // Check org exists
+  const orgs = await loadAllOrgs();
+  const org = orgs.find(o => o.tenant_id === tenant_id);
+  if (!org) {
+    return res.status(404).json({ ok: false, error: 'Org not found. Please re-authorise.' });
+  }
+
+  const tokens = await switchOrg(tenant_id);
+  if (!tokens) {
+    return res.status(500).json({ ok: false, error: 'Failed to load tokens for this org' });
+  }
+
+  return res.json({
+    ok: true,
+    tenant_id: tokens.tenant_id,
+    tenant_name: tokens.tenant_name,
+    message: `Switched to ${tokens.tenant_name}. Restart Claude Desktop if needed.`,
+  });
 });
 
 // ── GET /api/token — JSON endpoint ───────────────────────────────────────────
@@ -1068,7 +1200,16 @@ function isMcpAuthorized(req) {
 
   const authHeader = req.get('authorization') || '';
   const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
-  return bearerToken === MCP_AUTH_TOKEN || req.query.token === MCP_AUTH_TOKEN;
+  const queryToken = typeof req.query.token === 'string' ? req.query.token : '';
+
+  return timingSafeEqual(bearerToken, MCP_AUTH_TOKEN) || timingSafeEqual(queryToken, MCP_AUTH_TOKEN);
+}
+
+/** Constant-time string compare so an invalid MCP_AUTH_TOKEN guess can't be timed. */
+function timingSafeEqual(a, b) {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
 }
 
 function getPublicBaseUrl(req) {
@@ -1206,6 +1347,56 @@ function renderPage({ title, content }) {
     font-size: 13px; line-height: 1.6; margin-top: 20px;
   }
   .info-box code { background: rgba(0,0,0,.06); padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+
+  /* ── Org switcher ── */
+  .org-switcher {
+    margin-bottom: 22px; padding-bottom: 20px;
+    border-bottom: 1px solid #e4e4e7;
+  }
+  .org-select-wrap {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .org-select-box { position: relative; display: inline-block; }
+  .org-select-icon {
+    position: absolute; left: 13px; top: 50%; transform: translateY(-50%);
+    font-size: 14px; pointer-events: none;
+  }
+  .org-switcher select {
+    appearance: none; -webkit-appearance: none; -moz-appearance: none;
+    min-width: 240px;
+    padding: 10px 34px 10px 38px;
+    border: 1px solid #d4d4d8; border-radius: 8px;
+    font-size: 13.5px; font-weight: 500; font-family: inherit;
+    background: #fafafa; color: #18181b;
+    cursor: pointer;
+    transition: border-color .15s, background-color .15s, box-shadow .15s;
+  }
+  .org-switcher select:hover  { background: #f4f4f5; border-color: #b4b4b8; }
+  .org-switcher select:focus {
+    outline: none; background: #fff; border-color: #18181b;
+    box-shadow: 0 0 0 3px rgba(24,24,27,.08);
+  }
+  .org-select-chevron {
+    position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+    font-size: 10px; color: #71717a; pointer-events: none;
+  }
+  .switch-status {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600;
+    padding: 6px 12px; border-radius: 20px;
+    opacity: 0; transform: translateY(-2px);
+    transition: opacity .18s, transform .18s;
+  }
+  .switch-status.show    { opacity: 1; transform: translateY(0); }
+  .switch-status.pending { background: #f4f4f5; color: #52525b; }
+  .switch-status.ok      { background: #dcfce7; color: #15803d; }
+  .switch-status.error   { background: #fee2e2; color: #b91c1c; }
+  .switch-spinner {
+    width: 11px; height: 11px; border-radius: 50%; flex: none;
+    border: 2px solid rgba(0,0,0,.15); border-top-color: currentColor;
+    animation: spin .6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -1233,6 +1424,33 @@ function renderPage({ title, content }) {
       btn.classList.add('copied');
       setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 2200);
     });
+  }
+
+  async function switchOrg(tenantId) {
+    const status = document.getElementById('switchStatus');
+    status.className = 'switch-status pending show';
+    status.innerHTML = '<span class="switch-spinner"></span> Switching';
+
+    try {
+      const res = await fetch('/api/switch-org', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tenant_id: tenantId }),
+      });
+      const data = await res.json();
+
+      if (data.ok) {
+        status.className = 'switch-status ok show';
+        status.textContent = '✓ Switched';
+        setTimeout(() => location.reload(), 700);
+      } else {
+        status.className = 'switch-status error show';
+        status.textContent = '✗ ' + (data.error || 'Failed');
+      }
+    } catch (err) {
+      status.className = 'switch-status error show';
+      status.textContent = '✗ Network error';
+    }
   }
 </script>
 

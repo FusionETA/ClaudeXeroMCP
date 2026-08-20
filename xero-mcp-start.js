@@ -63,23 +63,25 @@ function loadEnv() {
 // ── Token helpers (NeonDB) ────────────────────────────────────────────────────
 
 async function loadTokens() {
-  const rows = await sql`SELECT * FROM xero_tokens WHERE id = 1`;
+  // Multi-org schema: xero_active_org points at which row in xero_tokens
+  // (keyed by tenant_id, not id) is the one Claude Desktop should use.
+  const active = await sql`SELECT tenant_id FROM xero_active_org WHERE id = 1`;
+  if (!active[0]) return null;
+  const rows = await sql`SELECT * FROM xero_tokens WHERE tenant_id = ${active[0].tenant_id}`;
   return rows[0] ?? null;
 }
 
 async function saveTokens(data) {
   await sql`
     INSERT INTO xero_tokens
-      (id, access_token, refresh_token, expires_at, tenant_id, tenant_name, authorised_at, refreshed_at)
+      (tenant_id, tenant_name, access_token, refresh_token, expires_at, authorised_at, refreshed_at, is_active)
     VALUES
-      (1, ${data.access_token}, ${data.refresh_token}, ${data.expires_at},
-       ${data.tenant_id ?? null}, ${data.tenant_name ?? null},
-       ${data.authorised_at ?? null}, ${data.refreshed_at ?? null})
-    ON CONFLICT (id) DO UPDATE SET
+      (${data.tenant_id}, ${data.tenant_name ?? null}, ${data.access_token}, ${data.refresh_token},
+       ${data.expires_at}, ${data.authorised_at ?? null}, ${data.refreshed_at ?? null}, true)
+    ON CONFLICT (tenant_id) DO UPDATE SET
       access_token  = EXCLUDED.access_token,
       refresh_token = EXCLUDED.refresh_token,
       expires_at    = EXCLUDED.expires_at,
-      tenant_id     = EXCLUDED.tenant_id,
       tenant_name   = EXCLUDED.tenant_name,
       authorised_at = EXCLUDED.authorised_at,
       refreshed_at  = EXCLUDED.refreshed_at
